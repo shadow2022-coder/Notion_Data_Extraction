@@ -1,488 +1,722 @@
-# app.py
-import os
-import io
-import time
-import re
-import json
-import logging
-from datetime import date, timedelta, datetime
-from collections import deque
-from typing import Optional
-
+from flask import Flask, render_template_string, request, jsonify, send_file
 import requests
-from flask import Flask, render_template_string, request, jsonify, send_file, abort
+import json
+from datetime import date, timedelta, datetime
+import io
 from docx import Document
 
-# --------------------
-# App configuration
-# --------------------
 app = Flask(__name__)
-# Protect against very large bodies
-app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB
 
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-APP_API_KEY = os.getenv("APP_API_KEY")  # optional: require X-API-KEY header
-NOTION_VERSION = "2022-06-28"
-
-if not NOTION_TOKEN:
-    # Fail fast for deployments that forget to set secrets
-    raise RuntimeError("Environment variable NOTION_TOKEN is required")
-
-# --------------------
-# Logging (no secrets)
-# --------------------
-logger = logging.getLogger("notion_extractor")
-logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-logger.addHandler(handler)
-
-# --------------------
-# Security headers
-# --------------------
-@app.after_request
-def set_security_headers(resp):
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["Referrer-Policy"] = "no-referrer"
-    # Basic CSP - adapt if you add external assets
-    resp.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
-    return resp
-
-# --------------------
-# Lightweight rate limiter (per-IP)
-# Note: per-instance only. For robust rate limiting, use Redis or a managed solution.
-# --------------------
-RATE_LIMIT_REQUESTS = 30
-RATE_LIMIT_WINDOW = 60  # seconds
-_client_requests = {}  # ip -> deque[timestamps]
-
-def is_rate_limited(client_ip: str) -> bool:
-    now = time.time()
-    dq = _client_requests.setdefault(client_ip, deque())
-    # purge old timestamps
-    while dq and dq[0] <= now - RATE_LIMIT_WINDOW:
-        dq.popleft()
-    if len(dq) >= RATE_LIMIT_REQUESTS:
-        return True
-    dq.append(now)
-    return False
-
-# --------------------
-# HTML (removed token input; server uses NOTION_TOKEN)
-# --------------------
-HTML_TEMPLATE = """<!doctype html>
+# Note: For larger apps, it is recommended to move this to a separate templates/index.html file
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<title>Notion Data Extractor</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-body{font-family:Inter,system-ui,Arial,Helvetica,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:24px}
-.container{max-width:900px;margin:0 auto;background:#fff;padding:28px;border-radius:12px}
-h1{margin-bottom:6px}label{font-weight:600;display:block;margin-top:12px}input,select,button{width:100%;padding:10px;border-radius:8px;border:1px solid #e6e6e6}
-button{background:#4f46e5;color:#fff;border:none;margin-top:16px;padding:12px;font-weight:700}
-.results{background:#f8f9fa;padding:12px;border-radius:8px;margin-top:16px;white-space:pre-wrap}
-.small{font-size:13px;color:#666}
-.downloads{display:flex;gap:8px;margin-top:12px}
-.downloads button{flex:1;background:#10b981;color:white;border:none;padding:10px;border-radius:8px}
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Notion Data Extractor</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            color: #333;
+            font-size: 32px;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            color: #666;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            color: #333;
+            font-weight: 600;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+
+        input[type="text"],
+        input[type="date"],
+        input[type="number"],
+        select {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+
+        input:focus, select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .help-text {
+            font-size: 12px;
+            color: #999;
+            margin-top: 5px;
+        }
+
+        .date-range {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+
+        .button {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+
+        .button:hover {
+            transform: translateY(-2px);
+        }
+
+        .button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .dynamic-fields {
+            display: none;
+        }
+
+        .dynamic-fields.show {
+            display: block;
+        }
+
+        .status {
+            padding: 12px;
+            border-radius: 8px;
+            margin: 20px 0;
+            display: none;
+        }
+
+        .status.show {
+            display: block;
+        }
+
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .status.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 20px;
+            display: none;
+        }
+
+        .loading.show {
+            display: block;
+        }
+
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .results {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            display: none;
+        }
+
+        .results.show {
+            display: block;
+        }
+
+        .results h3 {
+            color: #333;
+            margin-bottom: 15px;
+        }
+
+        .results pre {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            overflow: auto;
+            max-height: 400px;
+            font-size: 13px;
+        }
+
+        .download-buttons {
+            display: none;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        .download-buttons.show {
+            display: flex;
+        }
+
+        .download-btn {
+            flex: 1;
+            padding: 10px;
+            background: #28a745;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+
+        .download-btn:hover {
+            background: #218838;
+        }
+
+        .info-box {
+            background: #e7f3ff;
+            border: 1px solid #b3d9ff;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+
+        .info-box h4 {
+            color: #004085;
+            margin-bottom: 8px;
+        }
+
+        .info-box ul {
+            margin-left: 20px;
+            color: #004085;
+            font-size: 13px;
+            line-height: 1.8;
+        }
+    </style>
 </head>
 <body>
-<div class="container">
-  <h1>Notion Data Extractor</h1>
-  <p class="small">This instance uses a server-side Notion integration token stored securely as an environment variable. Do not paste tokens here.</p>
+    <div class="container">
+        <div class="header">
+            <h1>Notion Data Extractor</h1>
+            <p>Extract your Notion database content with ease</p>
+        </div>
 
-  <div class="small" style="background:#eef2ff;padding:10px;border-radius:8px;">
-    <strong>Setup</strong>
-    <ol>
-      <li>Create a Notion Integration and copy its secret (server-side).</li>
-      <li>Share your database with the integration (Notion → ••• → Connections).</li>
-      <li>Provide Database ID below. The server uses the stored token to access Notion.</li>
-    </ol>
-  </div>
+        <div class="info-box">
+            <h4>Setup Instructions:</h4>
+            <ul>
+                <li>Get Integration Token from <a href="https://www.notion.so/my-integrations" target="_blank">Notion Integrations</a></li>
+                <li>Enter your Database ID (32 characters with dashes)</li>
+                <li>Share your database with the integration</li>
+            </ul>
+        </div>
 
-  <form id="extractForm">
-    <label for="databaseId">Database ID *</label>
-    <input id="databaseId" required placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"/>
+        <form id="extractForm">
+            <div class="form-group">
+                <label for="token">Notion Integration Token *</label>
+                <input type="text" id="token" placeholder="ntn_... or secret_..." required>
+                <div class="help-text">Your Notion API token</div>
+            </div>
 
-    <label for="dateProperty">Date Property (optional)</label>
-    <input id="dateProperty" placeholder="Date (default)"/>
+            <div class="form-group">
+                <label for="databaseId">Database ID *</label>
+                <input type="text" id="databaseId" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" required>
+                <div class="help-text">32-character database ID with dashes</div>
+            </div>
 
-    <label for="personProperty">Person Property (optional)</label>
-    <input id="personProperty" placeholder="Assignee (default)"/>
+            <div class="form-group">
+                <label for="dateProperty">Date Property Name</label>
+                <input type="text" id="dateProperty" value="Date" placeholder="Date">
+                <div class="help-text">Column name for dates (case-sensitive)</div>
+            </div>
 
-    <label for="extractMode">Extract Mode</label>
-    <select id="extractMode">
-      <option value="all">All Data</option>
-      <option value="today">Today Only</option>
-      <option value="specific_date">Specific Date</option>
-      <option value="date_range">Date Range</option>
-      <option value="last_n_days">Last N Days</option>
-    </select>
+            <div class="form-group">
+                <label for="personProperty">Person Property Name (Optional)</label>
+                <input type="text" id="personProperty" value="Assignee" placeholder="Assignee">
+                <div class="help-text">Column name for assignees</div>
+            </div>
 
-    <div id="dateControls" style="display:none">
-      <label for="specificDate">Specific Date</label>
-      <input id="specificDate" type="date"/>
-      <label for="startDate">Start Date</label>
-      <input id="startDate" type="date"/>
-      <label for="endDate">End Date</label>
-      <input id="endDate" type="date"/>
-      <label for="lastNDays">Last N Days</label>
-      <input id="lastNDays" type="number" min="1" max="365" value="7"/>
+            <div class="form-group">
+                <label for="extractMode">Extract Mode *</label>
+                <select id="extractMode" required>
+                    <option value="today">Today Only</option>
+                    <option value="specific_date">Specific Date</option>
+                    <option value="date_range">Date Range</option>
+                    <option value="last_n_days">Last N Days</option>
+                    <option value="all">All Data</option>
+                </select>
+            </div>
+
+            <div id="specificDateField" class="form-group dynamic-fields">
+                <label for="specificDate">Select Date</label>
+                <input type="date" id="specificDate">
+            </div>
+
+            <div id="dateRangeFields" class="form-group dynamic-fields">
+                <label>Date Range</label>
+                <div class="date-range">
+                    <input type="date" id="startDate" placeholder="Start">
+                    <input type="date" id="endDate" placeholder="End">
+                </div>
+            </div>
+
+            <div id="lastNDaysField" class="form-group dynamic-fields">
+                <label for="lastNDays">Number of Days</label>
+                <input type="number" id="lastNDays" value="7" min="1" max="365">
+            </div>
+
+            <button type="submit" class="button" id="extractBtn">Extract Data</button>
+        </form>
+
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <p>Extracting data from Notion...</p>
+        </div>
+
+        <div class="status" id="status"></div>
+
+        <div class="download-buttons" id="downloadButtons">
+            <button class="download-btn" onclick="downloadFile('json')">Download JSON</button>
+            <button class="download-btn" onclick="downloadFile('txt')">Download TXT</button>
+            <button class="download-btn" onclick="downloadFile('docx')">Download Word</button>
+        </div>
+
+        <div class="results" id="results">
+            <h3>Extraction Results</h3>
+            <pre id="resultsContent"></pre>
+        </div>
     </div>
 
-    <button id="extractBtn" type="submit">Extract</button>
-  </form>
+    <script>
+        let extractedData = null;
 
-  <div class="results" id="results" style="display:none"></div>
+        document.getElementById('extractMode').addEventListener('change', function() {
+            document.querySelectorAll('.dynamic-fields').forEach(f => f.classList.remove('show'));
+            
+            if (this.value === 'specific_date') {
+                document.getElementById('specificDateField').classList.add('show');
+            } else if (this.value === 'date_range') {
+                document.getElementById('dateRangeFields').classList.add('show');
+            } else if (this.value === 'last_n_days') {
+                document.getElementById('lastNDaysField').classList.add('show');
+            }
+        });
 
-  <div class="downloads" id="downloads" style="display:none">
-    <button onclick="download('json')">Download JSON</button>
-    <button onclick="download('txt')">Download TXT</button>
-    <button onclick="download('docx')">Download DOCX</button>
-  </div>
-</div>
+        function showStatus(message, type) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = 'status show ' + type;
+        }
 
-<script>
-const extractMode = document.getElementById("extractMode");
-const dateControls = document.getElementById("dateControls");
-extractMode.addEventListener("change", () => {
-  if (["specific_date","date_range","last_n_days"].includes(extractMode.value)) dateControls.style.display="block";
-  else dateControls.style.display="none";
-});
+        function showLoading(show) {
+            document.getElementById('loading').classList.toggle('show', show);
+            document.getElementById('extractBtn').disabled = show;
+        }
 
-async function postJson(path, body) {
-  const headers = {"Content-Type":"application/json"};
-  // If you set APP_API_KEY, include it here: headers["x-api-key"] = "<your_key>"
-  const resp = await fetch(path, {method:"POST", headers, body: JSON.stringify(body)});
-  const json = await resp.json().catch(()=>({error:"invalid json"}));
-  if (!resp.ok) throw new Error(json.error || "Request failed");
-  return json;
-}
+        document.getElementById('extractForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const formData = {
+                token: document.getElementById('token').value.trim(),
+                database_id: document.getElementById('databaseId').value.trim(),
+                date_property: document.getElementById('dateProperty').value.trim() || 'Date',
+                person_property: document.getElementById('personProperty').value.trim() || 'Assignee',
+                extract_mode: document.getElementById('extractMode').value,
+                specific_date: document.getElementById('specificDate').value,
+                start_date: document.getElementById('startDate').value,
+                end_date: document.getElementById('endDate').value,
+                last_n_days: document.getElementById('lastNDays').value
+            };
 
-let lastData = null;
+            showLoading(true);
+            document.getElementById('results').classList.remove('show');
+            document.getElementById('downloadButtons').classList.remove('show');
 
-document.getElementById("extractForm").addEventListener("submit", async (e)=>{
-  e.preventDefault();
-  const db = document.getElementById("databaseId").value.trim();
-  if (!db) { alert("Database ID required"); return; }
-  const body = {
-    database_id: db,
-    date_property: document.getElementById("dateProperty").value.trim() || "Date",
-    person_property: document.getElementById("personProperty").value.trim() || "Assignee",
-    extract_mode: document.getElementById("extractMode").value,
-    specific_date: document.getElementById("specificDate").value,
-    start_date: document.getElementById("startDate").value,
-    end_date: document.getElementById("endDate").value,
-    last_n_days: document.getElementById("lastNDays").value
-  };
-  document.getElementById("results").style.display="block";
-  document.getElementById("results").textContent="Extracting...";
-  try {
-    const res = await postJson("/extract", body);
-    lastData = res.data || [];
-    if (!Array.isArray(lastData) || lastData.length===0) {
-      document.getElementById("results").textContent = "No pages found.";
-      document.getElementById("downloads").style.display="none";
-      return;
-    }
-    document.getElementById("results").textContent = JSON.stringify(lastData, null, 2);
-    document.getElementById("downloads").style.display="flex";
-  } catch(err) {
-    document.getElementById("results").textContent = "Error: " + err.message;
-    document.getElementById("downloads").style.display="none";
-  }
-});
+            try {
+                const response = await fetch('/extract', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(formData)
+                });
 
-async function download(fmt) {
-  if (!lastData) return alert("No data to download");
-  try {
-    const resp = await fetch("/download/" + fmt, {
-      method: "POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({data: lastData})
-    });
-    if (!resp.ok) {
-      const e = await resp.json().catch(()=>({error:"download failed"}));
-      throw new Error(e.error || "Download failed");
-    }
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `notion_export_${new Date().toISOString().split("T")[0]}.${fmt}`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  } catch(e) {
-    alert("Download error: " + e.message);
-  }
-}
-</script>
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error || 'Extraction failed');
+                }
+
+                extractedData = data.data;
+
+                const resultText = data.data.map((item, i) => 
+                    `${i + 1}. ${item.title}\\n   Date: ${item.date}\\n   Assignee: ${item.assignee}\\n   Content length: ${item.content.length} chars`
+                ).join('\\n\\n');
+
+                document.getElementById('resultsContent').textContent = resultText;
+                document.getElementById('results').classList.add('show');
+                document.getElementById('downloadButtons').classList.add('show');
+
+                showStatus(`Successfully extracted ${data.data.length} page(s).`, 'success');
+
+            } catch (error) {
+                showStatus(`Error: ${error.message}`, 'error');
+            } finally {
+                showLoading(false);
+            }
+        });
+
+        async function downloadFile(format) {
+            if (!extractedData) return;
+
+            try {
+                const response = await fetch('/download/' + format, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({data: extractedData})
+                });
+
+                if (!response.ok) {
+                    const err = await response.json();
+                    throw new Error(err.error || 'Download failed');
+                }
+
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `notion_export_${new Date().toISOString().split('T')[0]}.${format}`;
+                a.click();
+                window.URL.revokeObjectURL(url);
+            } catch (error) {
+                showStatus(`Download failed: ${error.message}`, 'error');
+            }
+        }
+    </script>
 </body>
 </html>
-"""
+'''
 
-# --------------------
-# Validation helpers
-# --------------------
-DB_ID_PATTERN = re.compile(r"^[0-9a-fA-F-]{32,64}$")
-ALLOWED_MODES = {"today", "specific_date", "date_range", "last_n_days", "all"}
-
-def validate_database_id(db_id: str) -> bool:
-    return bool(DB_ID_PATTERN.match(db_id.strip()))
-
-def safe_get_json(req):
-    try:
-        return req.get_json(force=True)
-    except Exception:
-        return {}
-
-# --------------------
-# Date filter builder
-# --------------------
-def get_date_filter(mode: str, date_property: str, **kwargs) -> Optional[dict]:
+def get_date_filter(mode, date_property, **kwargs):
+    """Build date filter based on mode"""
     today = date.today().isoformat()
-    if mode == "today":
+    
+    if mode == 'today':
         tomorrow = (date.today() + timedelta(days=1)).isoformat()
-        return {"and":[{"property":date_property,"date":{"on_or_after":today}},
-                       {"property":date_property,"date":{"before":tomorrow}}]}
-    if mode == "specific_date":
-        specific = kwargs.get("specific_date")
+        return {
+            "and": [
+                {"property": date_property, "date": {"on_or_after": today}},
+                {"property": date_property, "date": {"before": tomorrow}}
+            ]
+        }
+    elif mode == 'specific_date':
+        specific = kwargs.get('specific_date')
         if not specific:
             return None
         next_day = (datetime.strptime(specific, "%Y-%m-%d") + timedelta(days=1)).date().isoformat()
-        return {"and":[{"property":date_property,"date":{"on_or_after":specific}},
-                       {"property":date_property,"date":{"before":next_day}}]}
-    if mode == "date_range":
-        start = kwargs.get("start_date")
-        end = kwargs.get("end_date")
+        return {
+            "and": [
+                {"property": date_property, "date": {"on_or_after": specific}},
+                {"property": date_property, "date": {"before": next_day}}
+            ]
+        }
+    elif mode == 'date_range':
+        start = kwargs.get('start_date')
+        end = kwargs.get('end_date')
         if not start or not end:
             return None
-        return {"and":[{"property":date_property,"date":{"on_or_after":start}},
-                       {"property":date_property,"date":{"on_or_before":end}}]}
-    if mode == "last_n_days":
+        return {
+            "and": [
+                {"property": date_property, "date": {"on_or_after": start}},
+                {"property": date_property, "date": {"on_or_before": end}}
+            ]
+        }
+    elif mode == 'last_n_days':
         try:
-            n = int(kwargs.get("last_n_days", 7))
+            n_days = int(kwargs.get('last_n_days', 7))
         except Exception:
-            n = 7
-        start = (date.today() - timedelta(days=n-1)).isoformat()
-        return {"and":[{"property":date_property,"date":{"on_or_after":start}},
-                       {"property":date_property,"date":{"on_or_before":today}}]}
+            n_days = 7
+        start = (date.today() - timedelta(days=n_days - 1)).isoformat()
+        return {
+            "and": [
+                {"property": date_property, "date": {"on_or_after": start}},
+                {"property": date_property, "date": {"on_or_before": today}}
+            ]
+        }
     return None
 
-# --------------------
-# Helpers: JSON/TXT/DOCX bytes
-# --------------------
-def _json_bytes(data):
-    out = io.BytesIO()
-    out.write(json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8"))
-    out.seek(0)
-    return out
-
-def _txt_bytes(data):
-    text = f"NOTION EXPORT - {date.today().isoformat()}\n" + ("="*80) + "\n\n"
-    for item in data:
-        text += "\n" + ("="*80) + "\n"
-        text += f"TITLE: {item.get('title','Untitled')}\n"
-        text += f"DATE: {item.get('date','No date')}\n"
-        text += f"BY: {item.get('assignee','Unassigned')}\n"
-        text += f"URL: {item.get('url','')}\n"
-        text += ("="*80) + "\n\n"
-        text += item.get("content","") + "\n\n"
-    b = io.BytesIO()
-    b.write(text.encode("utf-8"))
-    b.seek(0)
-    return b
-
-def _docx_bytes(data):
-    doc = Document()
-    doc.add_heading("Notion Export", level=1)
-    doc.add_paragraph(f"Export date: {date.today().isoformat()}")
-    for i, item in enumerate(data, start=1):
-        doc.add_heading(f"{i}. {item.get('title','Untitled')}", level=2)
-        doc.add_paragraph(f"Date: {item.get('date','No date')}")
-        doc.add_paragraph(f"Assignee: {item.get('assignee','Unassigned')}")
-        doc.add_paragraph(f"URL: {item.get('url','')}")
-        doc.add_paragraph("")
-        content = item.get("content","")
-        if content:
-            for para in content.splitlines():
-                if para.strip():
-                    doc.add_paragraph(para)
-                else:
-                    doc.add_paragraph("")
-        if i != len(data):
-            doc.add_page_break()
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf
-
-# --------------------
-# Routes
-# --------------------
-@app.route("/", methods=["GET"])
+@app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route("/extract", methods=["POST"])
+@app.route('/extract', methods=['POST'])
 def extract():
-    # basic per-IP rate limiting
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-    if is_rate_limited(client_ip):
-        return jsonify({"error":"Too many requests"}), 429
-
-    # optional API key enforcement
-    if APP_API_KEY:
-        key = request.headers.get("x-api-key")
-        if not key or key != APP_API_KEY:
-            return jsonify({"error":"Unauthorized"}), 401
-
-    payload = safe_get_json(request)
-    database_id = (payload.get("database_id") or "").strip()
-    date_property = payload.get("date_property") or "Date"
-    person_property = payload.get("person_property") or "Assignee"
-    extract_mode = payload.get("extract_mode") or "all"
-
-    # validate
-    if not database_id or not validate_database_id(database_id):
-        return jsonify({"error":"Invalid database_id"}), 400
-    if extract_mode not in ALLOWED_MODES:
-        return jsonify({"error":"Invalid extract_mode"}), 400
-
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": NOTION_VERSION
-    }
-
-    date_filter = get_date_filter(
-        extract_mode, date_property,
-        specific_date=payload.get("specific_date"),
-        start_date=payload.get("start_date"),
-        end_date=payload.get("end_date"),
-        last_n_days=payload.get("last_n_days")
-    )
-    query_body = {"filter": date_filter} if date_filter else {}
-
     try:
-        resp = requests.post(
-            f"https://api.notion.com/v1/databases/{database_id}/query",
-            headers=headers,
-            json=query_body,
-            timeout=25
+        data = request.get_json(force=True)
+
+        token = data.get('token')
+        database_id = data.get('database_id')
+        date_property = data.get('date_property') or 'Date'
+        person_property = data.get('person_property') or 'Assignee'
+        extract_mode = data.get('extract_mode') or 'all'
+
+        if not token or not database_id:
+            return jsonify({"error": "token and database_id are required"}), 400
+        
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json',
+            'Notion-Version': '2022-06-28'
+        }
+        
+        # Build filter
+        date_filter = get_date_filter(
+            extract_mode, 
+            date_property,
+            specific_date=data.get('specific_date'),
+            start_date=data.get('start_date'),
+            end_date=data.get('end_date'),
+            last_n_days=data.get('last_n_days')
         )
-    except requests.RequestException as exc:
-        logger.warning("Notion API request failed: %s", str(exc))
-        return jsonify({"error":"Upstream request failed"}), 502
-
-    if resp.status_code != 200:
-        # log details server-side; do not leak raw upstream content
-        try:
-            logger.info("Notion returned %s: %.200s", resp.status_code, resp.text)
-        except Exception:
-            pass
-        return jsonify({"error":"Notion API returned an error"}), resp.status_code
-
-    try:
-        pages = resp.json().get("results", [])
-    except Exception:
-        return jsonify({"error":"Invalid response from Notion"}), 502
-
-    if not pages:
-        return jsonify({"data": []}), 200
-
-    processed = []
-    for page in pages:
-        props = page.get("properties", {})
-
-        # Title detection
-        title = "Untitled"
-        for n in ("Name","Title","name","title"):
-            if n in props and props[n].get("title"):
-                tlist = props[n]["title"]
-                if isinstance(tlist, list) and tlist:
-                    title = tlist[0].get("plain_text","Untitled")
-                break
-
-        # Date
-        page_date = "No date"
-        if date_property in props and props[date_property].get("date"):
-            page_date = props[date_property]["date"].get("start", "No date")
-
-        # Assignee
-        assignee = "Unassigned"
-        if person_property in props and props[person_property].get("people"):
-            ppl = props[person_property]["people"]
-            if isinstance(ppl, list) and ppl:
-                assignee = ppl[0].get("name") or ppl[0].get("id") or "Unknown"
-
-        # Blocks — single page children (no deep pagination)
-        content = ""
-        try:
-            br = requests.get(f"https://api.notion.com/v1/blocks/{page.get('id')}/children",
-                              headers=headers, timeout=25)
-            if br.ok:
-                blocks = br.json().get("results", [])
-                parts = []
+        
+        payload = {"filter": date_filter} if date_filter else {}
+        
+        # Query database
+        response = requests.post(
+            f'https://api.notion.com/v1/databases/{database_id}/query',
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        
+        if not response.ok:
+            # Attempt to return Notion's message if available
+            try:
+                err = response.json()
+                return jsonify({"error": err.get('message', 'API request failed')}), response.status_code
+            except Exception:
+                return jsonify({"error": "API request failed"}), response.status_code
+        
+        pages = response.json().get('results', [])
+        
+        if not pages:
+            return jsonify({"error": "No pages found matching criteria"}), 404
+        
+        # Process pages
+        processed_data = []
+        
+        for page in pages:
+            props = page.get('properties', {})
+            
+            # Get title
+            title = 'Untitled'
+            for prop_name in ['Name', 'Title', 'name', 'title']:
+                if prop_name in props and props[prop_name].get('title'):
+                    title_field = props[prop_name]['title']
+                    if isinstance(title_field, list) and title_field:
+                        title = title_field[0].get('plain_text', title)
+                    break
+            
+            # Get date
+            page_date = 'No date'
+            if date_property in props and props[date_property].get('date'):
+                page_date = props[date_property]['date'].get('start', 'No date')
+            
+            # Get assignee
+            assignee = 'Unassigned'
+            if person_property in props and props[person_property].get('people'):
+                people = props[person_property]['people']
+                if isinstance(people, list) and people:
+                    assignee = people[0].get('name') or people[0].get('id') or 'Unknown'
+            
+            # Fetch blocks
+            blocks_response = requests.get(
+                f'https://api.notion.com/v1/blocks/{page.get("id")}/children',
+                headers=headers,
+                timeout=30
+            )
+            
+            content = ''
+            if blocks_response.ok:
+                blocks = blocks_response.json().get('results', [])
+                text_parts = []
+                
                 for block in blocks:
-                    btype = block.get("type")
-                    if btype and block.get(btype, {}).get("rich_text"):
-                        parts.append(" ".join([t.get("plain_text","") for t in block[btype]["rich_text"]]))
-                    elif block.get("paragraph") and block["paragraph"].get("rich_text"):
-                        parts.append(" ".join([t.get("plain_text","") for t in block["paragraph"]["rich_text"]]))
-                content = "\n".join([p for p in parts if p])
-        except Exception:
-            logger.debug("Failed to fetch blocks for page %s", page.get("id"))
+                    block_type = block.get('type')
+                    if block_type and block.get(block_type, {}).get('rich_text'):
+                        texts = [t.get('plain_text', '') for t in block[block_type]['rich_text']]
+                        text_parts.append(' '.join(texts))
+                    else:
+                        # handle paragraph which may be stored under 'paragraph' with 'rich_text'
+                        if block.get('paragraph') and block['paragraph'].get('rich_text'):
+                            texts = [t.get('plain_text', '') for t in block['paragraph']['rich_text']]
+                            text_parts.append(' '.join(texts))
+                
+                content = '\n'.join([p for p in text_parts if p])
+            
+            processed_data.append({
+                'page_id': page.get('id'),
+                'title': title,
+                'date': page_date,
+                'assignee': assignee,
+                'content': content,
+                'url': f"https://www.notion.so/{page.get('id', '').replace('-', '')}"
+            })
+        
+        return jsonify({"data": processed_data})
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-        processed.append({
-            "page_id": page.get("id"),
-            "title": title,
-            "date": page_date,
-            "assignee": assignee,
-            "content": content,
-            "url": f"https://www.notion.so/{(page.get('id') or '').replace('-','')}"
-        })
+@app.route('/download/<format>', methods=['POST'])
+def download(format):
+    try:
+        payload = request.get_json(force=True) or {}
+        data = payload.get('data', [])
 
-    return jsonify({"data": processed}), 200
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
 
-@app.route("/download/<fmt>", methods=["POST"])
-def download(fmt):
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-    if is_rate_limited(client_ip):
-        return jsonify({"error":"Too many requests"}), 429
+        # JSON export
+        if format == 'json':
+            output = io.BytesIO()
+            output.write(json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8'))
+            output.seek(0)
+            return send_file(
+                output,
+                mimetype='application/json',
+                as_attachment=True,
+                download_name=f'notion_export_{date.today().isoformat()}.json'
+            )
 
-    # optional auth
-    if APP_API_KEY:
-        key = request.headers.get("x-api-key")
-        if not key or key != APP_API_KEY:
-            return jsonify({"error":"Unauthorized"}), 401
+        # TXT export
+        elif format == 'txt':
+            text = f"NOTION EXPORT - {date.today().isoformat()}\n"
+            text += "=" * 80 + "\n\n"
+            
+            for item in data:
+                text += "\n" + "=" * 80 + "\n"
+                text += f"TITLE: {item.get('title', 'Untitled')}\n"
+                text += f"DATE: {item.get('date', 'No date')}\n"
+                text += f"BY: {item.get('assignee', 'Unassigned')}\n"
+                text += f"URL: {item.get('url', '')}\n"
+                text += "=" * 80 + "\n\n"
+                text += item.get('content', '') + "\n\n"
+            
+            output = io.BytesIO()
+            output.write(text.encode('utf-8'))
+            output.seek(0)
+            return send_file(
+                output,
+                mimetype='text/plain',
+                as_attachment=True,
+                download_name=f'notion_export_{date.today().isoformat()}.txt'
+            )
 
-    payload = safe_get_json(request)
-    data = payload.get("data", [])
-    if not isinstance(data, list) or not data:
-        return jsonify({"error":"No data provided"}), 400
+        # DOCX export
+        elif format == 'docx':
+            doc = Document()
+            doc.add_heading('Notion Export', level=1)
+            doc.add_paragraph(f"Export date: {date.today().isoformat()}")
+            doc.add_paragraph('')
 
-    if fmt == "json":
-        buf = _json_bytes(data)
-        return send_file(buf, as_attachment=True, download_name=f"notion_export_{date.today().isoformat()}.json", mimetype="application/json")
-    elif fmt == "txt":
-        buf = _txt_bytes(data)
-        return send_file(buf, as_attachment=True, download_name=f"notion_export_{date.today().isoformat()}.txt", mimetype="text/plain")
-    elif fmt == "docx":
-        buf = _docx_bytes(data)
-        return send_file(buf, as_attachment=True, download_name=f"notion_export_{date.today().isoformat()}.docx", mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-    else:
-        return jsonify({"error":"Unsupported format"}), 400
+            for i, item in enumerate(data, start=1):
+                title = item.get('title', 'Untitled')
+                page_date = item.get('date', 'No date')
+                assignee = item.get('assignee', 'Unassigned')
+                content = item.get('content', '')
 
-# --------------------
-# Local entrypoint only
-# --------------------
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "3000"))
-    # Local only: do not enable debug in production
-    app.run(host="0.0.0.0", port=port)
+                # Title and metadata
+                doc.add_heading(f"{i}. {title}", level=2)
+                doc.add_paragraph(f"Date: {page_date}")
+                doc.add_paragraph(f"Assignee: {assignee}")
+                doc.add_paragraph(f"URL: {item.get('url', '')}")
+                doc.add_paragraph('')
+
+                # Content — preserve paragraphs split by newline
+                if content:
+                    for para in content.splitlines():
+                        # skip empty lines to avoid many empty paragraphs
+                        if para.strip():
+                            doc.add_paragraph(para)
+                        else:
+                            doc.add_paragraph('')
+
+                # Add page break between entries (but not after last)
+                if i != len(data):
+                    doc.add_page_break()
+
+            buffer = io.BytesIO()
+            doc.save(buffer)
+            buffer.seek(0)
+
+            return send_file(
+                buffer,
+                mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                as_attachment=True,
+                download_name=f'notion_export_{date.today().isoformat()}.docx'
+            )
+
+        else:
+            return jsonify({"error": f"Unsupported format: {format}"}), 400
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# This part is optional on Vercel but useful for local testing
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)

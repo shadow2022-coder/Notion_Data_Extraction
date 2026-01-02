@@ -717,6 +717,5 @@ def download(format):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# This part is optional on Vercel but useful for local testing
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
